@@ -50,6 +50,7 @@ type PlayerData = {
   rating: number | null
   minutes_played: number | null
   matches_started: number | null
+  contract_until: string | null
 }
 
 type ClubData = {
@@ -101,7 +102,7 @@ export default function CycleRadar() {
     async function load() {
       const { data } = await supabase
         .from('players')
-        .select('sofascore_id, name, team, age, position, player_stats(rating, minutes_played, matches_started)')
+        .select('sofascore_id, name, team, age, position, contract_until, player_stats(rating, minutes_played, matches_started)')
         .eq('league', 'Bundesliga')
 
       if (!data) { setLoading(false); return }
@@ -115,6 +116,7 @@ export default function CycleRadar() {
         rating: p.player_stats?.[0]?.rating ?? null,
         minutes_played: p.player_stats?.[0]?.minutes_played ?? null,
         matches_started: p.player_stats?.[0]?.matches_started ?? null,
+        contract_until: p.contract_until ?? null,
       }))
 
       const teamMap = new Map<string, (PlayerData & { team: string })[]>()
@@ -157,6 +159,27 @@ export default function CycleRadar() {
         const avgAge = top5.length ? top5.reduce((s, p) => s + (p.age ?? 25), 0) / top5.length : 25
         return { ...c, phase: getPhase(avgAge, c.currentRating, medAge, medRating) }
       }).sort((a, b) => a.tablePos - b.tablePos) // sort by table position
+
+      // Pre-populate departures from contract data
+      const today = new Date()
+      const autoDeps: Record<string, Record<number, number>> = {}
+      finalClubs.forEach(club => {
+        const clubDeps: Record<number, number> = {}
+        club.players.forEach(p => {
+          if (!p.contract_until) return
+          const expiry = new Date(p.contract_until)
+          if (expiry <= today) return  // stale/expired data → ignore
+          let depYear: number | undefined
+          if (expiry < new Date('2027-07-01'))      depYear = 2  // läuft Sommer 2026 aus
+          else if (expiry < new Date('2028-07-01')) depYear = 3  // Sommer 2027
+          else if (expiry < new Date('2029-07-01')) depYear = 4  // Sommer 2028
+          else if (expiry < new Date('2030-07-01')) depYear = 5  // Sommer 2029
+          // 2030+: Vertrag läuft durch Projektionsfenster → kein Auto-Abgang
+          if (depYear !== undefined) clubDeps[p.sofascore_id] = depYear
+        })
+        if (Object.keys(clubDeps).length > 0) autoDeps[club.name] = clubDeps
+      })
+      setDepartures(autoDeps)
 
       setClubs(finalClubs)
       setSelected(finalClubs[0]?.name ?? null)
@@ -373,12 +396,31 @@ export default function CycleRadar() {
                     background: rColor + '18', color: rColor,
                   }}>{p.rating?.toFixed(2) ?? '—'}</span>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{
-                      fontFamily: 'var(--font-mono)', fontSize: '0.72rem',
-                      color: depYear !== undefined ? '#ef4444' : (isTop5 ? '#fff' : 'rgba(255,255,255,0.5)'),
-                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      textDecoration: depYear !== undefined ? 'line-through' : 'none',
-                    }}>{p.name}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                      <span style={{
+                        fontFamily: 'var(--font-mono)', fontSize: '0.72rem',
+                        color: depYear !== undefined ? '#ef4444' : (isTop5 ? '#fff' : 'rgba(255,255,255,0.5)'),
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        textDecoration: depYear !== undefined ? 'line-through' : 'none',
+                        flex: 1, minWidth: 0,
+                      }}>{p.name}</span>
+                      {(() => {
+                        if (!p.contract_until) return null
+                        const expiry = new Date(p.contract_until)
+                        const now = new Date()
+                        if (expiry <= now) return null  // stale, nicht anzeigen
+                        const yr = expiry.getFullYear()
+                        const label = `'${String(yr).slice(2)}`
+                        const color = yr <= 2026 ? '#ef4444' : yr <= 2027 ? '#f59e0b' : yr <= 2029 ? '#84cc16' : '#22c55e'
+                        return (
+                          <span style={{
+                            fontFamily: 'var(--font-mono)', fontSize: '0.55rem', flexShrink: 0,
+                            padding: '1px 4px', borderRadius: '3px',
+                            border: `1px solid ${color}50`, background: `${color}12`, color,
+                          }}>{label}</span>
+                        )
+                      })()}
+                    </div>
                     <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.58rem', color: 'rgba(255,255,255,0.25)' }}>
                       {p.position ?? '—'} · {p.age ?? '—'} J. · {p.matches_started ?? '—'} Starts
                     </div>
