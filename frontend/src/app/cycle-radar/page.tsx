@@ -8,7 +8,7 @@ import { supabase } from '@/lib/supabase'
 
 Chart.register(LineController, LinearScale, CategoryScale, PointElement, LineElement, Tooltip)
 
-const YEARS = ['25/26', '26/27', '27/28', '28/29', '29/30']
+const YEARS = ['25/26', '26/27', '27/28', '28/29']
 
 // Bundesliga 25/26 Tabellenplatz (1 = Meister) — aus Sofascore Standings
 const BL_TABLE: Record<string, number> = {
@@ -41,6 +41,14 @@ const PHASE_COLOR: Record<string, string> = {
 const PHASE_LABEL: Record<string, string> = {
   prime: 'Prime', transition: 'Transition', rebuild: 'Rebuild', stable: 'Stabil',
 }
+
+// Sommer-Fenster → dep-Wert (dep > year = Spieler noch aktiv in "year")
+// dep=2: weg ab 26/27 (Sommer '26), dep=3: weg ab 27/28, dep=4: weg ab 28/29
+const DEP_BUTTONS = [
+  { label: "ab 26/27", dep: 2 },
+  { label: "ab 27/28", dep: 3 },
+  { label: "ab 28/29", dep: 4 },
+]
 
 type PlayerData = {
   sofascore_id: number
@@ -76,16 +84,25 @@ function getPhase(avgAge: number, avgRating: number, medAge: number, medRating: 
   return 'stable'
 }
 
-// Year N: top 5 of active players (not yet departed) → avg rating
-function projectRatings(players: PlayerData[], departures: Record<number, number>): number[] {
-  return [1, 2, 3, 4, 5].map(year => {
+/**
+ * Projiziert die Ø Note Top 5 pro Saison (4 Jahre).
+ * Abgegangene Slots werden mit leagueAvg aufgefüllt —
+ * verhindert künstlich hohe Werte wenn nur 1-2 Stars verbleiben.
+ */
+function projectRatings(
+  players: PlayerData[],
+  departures: Record<number, number>,
+  leagueAvg: number,
+): number[] {
+  return [1, 2, 3, 4].map(year => {
     const active = players.filter(p => {
       const dep = departures[p.sofascore_id]
       return dep === undefined || dep > year
     })
     const top5 = active.slice(0, 5)
-    if (!top5.length) return 6.0
-    return top5.reduce((s, p) => s + (p.rating ?? 6.5), 0) / top5.length
+    const filled = 5 - top5.length  // Slots für Ersatzspieler
+    const sumActive = top5.reduce((s, p) => s + (p.rating ?? leagueAvg), 0)
+    return (sumActive + filled * leagueAvg) / 5
   })
 }
 
@@ -94,8 +111,8 @@ export default function CycleRadar() {
   const chartRef = useRef<Chart | null>(null)
   const [clubs, setClubs] = useState<ClubData[]>([])
   const [selected, setSelected] = useState<string | null>(null)
-  // Departures stored per club — never reset on club switch
   const [departures, setDepartures] = useState<Record<string, Record<number, number>>>({})
+  const [leagueAvg, setLeagueAvg] = useState(6.8)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -127,7 +144,6 @@ export default function CycleRadar() {
 
       const rawClubs: ClubData[] = []
       teamMap.forEach((players, name) => {
-        // Only players with rating AND at least 5 starts (excludes rarely-played keepers etc.)
         const eligible = players.filter(p =>
           p.rating != null &&
           (p.matches_started ?? 0) >= 5
@@ -147,7 +163,14 @@ export default function CycleRadar() {
         })
       })
 
-      // Classify phases
+      // Liga-Ø aus allen qualifizierten Spielern berechnen
+      const allRatings = rawClubs.flatMap(c => c.players.map(p => p.rating ?? 0)).filter(r => r > 0)
+      const computedLeagueAvg = allRatings.length
+        ? allRatings.reduce((s, r) => s + r, 0) / allRatings.length
+        : 6.8
+      setLeagueAvg(computedLeagueAvg)
+
+      // Phasen klassifizieren
       const medAge = median(rawClubs.map(c => {
         const top5 = c.players.slice(0, 5)
         return top5.length ? top5.reduce((s, p) => s + (p.age ?? 25), 0) / top5.length : 25
@@ -158,9 +181,9 @@ export default function CycleRadar() {
         const top5 = c.players.slice(0, 5)
         const avgAge = top5.length ? top5.reduce((s, p) => s + (p.age ?? 25), 0) / top5.length : 25
         return { ...c, phase: getPhase(avgAge, c.currentRating, medAge, medRating) }
-      }).sort((a, b) => a.tablePos - b.tablePos) // sort by table position
+      }).sort((a, b) => a.tablePos - b.tablePos)
 
-      // Pre-populate departures from contract data
+      // Auto-Abgänge aus Vertragsdaten vorbelegen
       const today = new Date()
       const autoDeps: Record<string, Record<number, number>> = {}
       finalClubs.forEach(club => {
@@ -168,13 +191,12 @@ export default function CycleRadar() {
         club.players.forEach(p => {
           if (!p.contract_until) return
           const expiry = new Date(p.contract_until)
-          if (expiry <= today) return  // stale/expired data → ignore
+          if (expiry <= today) return
           let depYear: number | undefined
-          if (expiry < new Date('2027-07-01'))      depYear = 2  // läuft Sommer 2026 aus
+          if (expiry < new Date('2027-07-01'))      depYear = 2  // Sommer 2026
           else if (expiry < new Date('2028-07-01')) depYear = 3  // Sommer 2027
           else if (expiry < new Date('2029-07-01')) depYear = 4  // Sommer 2028
-          else if (expiry < new Date('2030-07-01')) depYear = 5  // Sommer 2029
-          // 2030+: Vertrag läuft durch Projektionsfenster → kein Auto-Abgang
+          // 2029+: aktiv durch gesamtes 4-Jahres-Fenster
           if (depYear !== undefined) clubDeps[p.sofascore_id] = depYear
         })
         if (Object.keys(clubDeps).length > 0) autoDeps[club.name] = clubDeps
@@ -188,7 +210,6 @@ export default function CycleRadar() {
     load()
   }, [])
 
-  // Build / rebuild chart whenever clubs, selected or departures change
   useEffect(() => {
     if (!clubs.length || !canvasRef.current) return
 
@@ -200,7 +221,7 @@ export default function CycleRadar() {
     const datasets = clubs.map(club => {
       const isSelected = club.name === selected
       const dep = departures[club.name] ?? {}
-      const ratings = projectRatings(club.players, dep)
+      const ratings = projectRatings(club.players, dep, leagueAvg)
       const color = PHASE_COLOR[club.phase] ?? '#888'
 
       return {
@@ -228,10 +249,11 @@ export default function CycleRadar() {
         scales: {
           x: {
             grid: { color: gridColor },
+            title: { display: true, text: 'Saison', color: textColor, font: { size: 10 } },
             ticks: { color: textColor, font: { size: 11 } },
           },
           y: {
-            min: 6.2,
+            min: 5.8,
             max: 7.8,
             title: { display: true, text: 'Ø Note Top 5', color: textColor, font: { size: 11 } },
             grid: { color: gridColor },
@@ -256,7 +278,7 @@ export default function CycleRadar() {
         },
       },
     })
-  }, [clubs, selected, departures])
+  }, [clubs, selected, departures, leagueAvg])
 
   useEffect(() => () => { chartRef.current?.destroy() }, [])
 
@@ -265,15 +287,15 @@ export default function CycleRadar() {
   const hasDepartures = Object.keys(clubDeps).length > 0
   const totalDepartures = Object.values(departures).reduce((s, d) => s + Object.keys(d).length, 0)
 
-  function toggleDeparture(playerId: number, year?: number) {
+  function toggleDeparture(playerId: number, dep?: number) {
     if (!selected) return
     setDepartures(prev => {
       const clubDeps = prev[selected] ?? {}
-      if (year === undefined) {
+      if (dep === undefined) {
         const { [playerId]: _, ...rest } = clubDeps
         return { ...prev, [selected]: rest }
       }
-      return { ...prev, [selected]: { ...clubDeps, [playerId]: year } }
+      return { ...prev, [selected]: { ...clubDeps, [playerId]: dep } }
     })
   }
 
@@ -293,7 +315,7 @@ export default function CycleRadar() {
           CYCLE RADAR
         </h1>
         <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.72rem', color: 'rgba(255,255,255,0.35)', marginTop: '4px' }}>
-          Bundesliga 25/26 · 5-Jahres-Projektion · Spieler-Abgänge simulieren
+          Bundesliga 25/26 · 4-Jahres-Projektion · Abgänge aus Vertragsdaten
           {totalDepartures > 0 && (
             <span style={{ color: '#ef4444', marginLeft: '12px' }}>{totalDepartures} Abgang{totalDepartures > 1 ? 'ë' : ''} aktiv</span>
           )}
@@ -302,7 +324,7 @@ export default function CycleRadar() {
 
       <div style={{ display: 'grid', gridTemplateColumns: '190px 1fr 230px', gap: '16px', alignItems: 'start' }}>
 
-        {/* Left: Club list sorted by table position */}
+        {/* Left: Club list */}
         <div className="tl-card" style={{ padding: '8px', maxHeight: '540px', overflowY: 'auto' }}>
           <p style={{ fontFamily: 'var(--font-display)', fontSize: '0.6rem', letterSpacing: '0.1em', color: 'rgba(255,255,255,0.25)', padding: '4px 8px 8px' }}>
             TABELLE 25/26
@@ -341,30 +363,35 @@ export default function CycleRadar() {
 
         {/* Center: Chart */}
         <div className="tl-card" style={{ padding: '20px', height: '540px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+          <div style={{ marginBottom: '10px' }}>
             {selectedClub && (
               <>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>
-                  #{selectedClub.tablePos}
-                </span>
-                <span style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '1rem', color: '#fff' }}>
-                  {selected}
-                </span>
-                <span style={{
-                  fontFamily: 'var(--font-mono)', fontSize: '0.62rem', padding: '2px 7px', borderRadius: '4px',
-                  background: PHASE_COLOR[selectedClub.phase] + '18',
-                  color: PHASE_COLOR[selectedClub.phase],
-                  border: `1px solid ${PHASE_COLOR[selectedClub.phase]}35`,
-                }}>{PHASE_LABEL[selectedClub.phase]}</span>
-                {hasDepartures && (
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.6rem', color: '#ef4444', marginLeft: 'auto' }}>
-                    {Object.keys(clubDeps).length}x Abgang simuliert
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'rgba(255,255,255,0.3)', fontWeight: 600 }}>
+                    #{selectedClub.tablePos}
                   </span>
-                )}
+                  <span style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '1rem', color: '#fff' }}>
+                    {selected}
+                  </span>
+                  <span style={{
+                    fontFamily: 'var(--font-mono)', fontSize: '0.62rem', padding: '2px 7px', borderRadius: '4px',
+                    background: PHASE_COLOR[selectedClub.phase] + '18',
+                    color: PHASE_COLOR[selectedClub.phase],
+                    border: `1px solid ${PHASE_COLOR[selectedClub.phase]}35`,
+                  }}>{PHASE_LABEL[selectedClub.phase]}</span>
+                  {hasDepartures && (
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.6rem', color: '#ef4444', marginLeft: 'auto' }}>
+                      {Object.keys(clubDeps).length}x Abgang
+                    </span>
+                  )}
+                </div>
+                <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.58rem', color: 'rgba(255,255,255,0.2)', marginTop: '4px' }}>
+                  Score = Ø Note Top 5 aktiver Stammspieler (≥5 Starts) · fehlende Slots → Liga-Ø {leagueAvg.toFixed(2)}
+                </p>
               </>
             )}
           </div>
-          <div style={{ height: 'calc(100% - 40px)', position: 'relative' }}>
+          <div style={{ height: 'calc(100% - 56px)', position: 'relative' }}>
             <canvas ref={canvasRef} />
           </div>
         </div>
@@ -377,7 +404,7 @@ export default function CycleRadar() {
 
           {selectedClub?.players.map((p, i) => {
             const isTop5 = i < 5
-            const depYear = clubDeps[p.sofascore_id]
+            const depVal = clubDeps[p.sofascore_id]
             const rColor = !p.rating ? '#666'
               : p.rating >= 7.5 ? '#22c55e'
               : p.rating >= 7.0 ? '#84cc16'
@@ -399,19 +426,18 @@ export default function CycleRadar() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                       <span style={{
                         fontFamily: 'var(--font-mono)', fontSize: '0.72rem',
-                        color: depYear !== undefined ? '#ef4444' : (isTop5 ? '#fff' : 'rgba(255,255,255,0.5)'),
+                        color: depVal !== undefined ? '#ef4444' : (isTop5 ? '#fff' : 'rgba(255,255,255,0.5)'),
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                        textDecoration: depYear !== undefined ? 'line-through' : 'none',
+                        textDecoration: depVal !== undefined ? 'line-through' : 'none',
                         flex: 1, minWidth: 0,
                       }}>{p.name}</span>
                       {(() => {
                         if (!p.contract_until) return null
                         const expiry = new Date(p.contract_until)
-                        const now = new Date()
-                        if (expiry <= now) return null  // stale, nicht anzeigen
+                        if (expiry <= new Date()) return null
                         const yr = expiry.getFullYear()
                         const label = `'${String(yr).slice(2)}`
-                        const color = yr <= 2026 ? '#ef4444' : yr <= 2027 ? '#f59e0b' : yr <= 2029 ? '#84cc16' : '#22c55e'
+                        const color = yr <= 2026 ? '#ef4444' : yr <= 2027 ? '#f59e0b' : yr <= 2028 ? '#84cc16' : '#22c55e'
                         return (
                           <span style={{
                             fontFamily: 'var(--font-mono)', fontSize: '0.55rem', flexShrink: 0,
@@ -425,31 +451,32 @@ export default function CycleRadar() {
                       {p.position ?? '—'} · {p.age ?? '—'} J. · {p.matches_started ?? '—'} Starts
                     </div>
                   </div>
-                  <button onClick={() => toggleDeparture(p.sofascore_id, depYear !== undefined ? undefined : 1)} style={{
+                  <button onClick={() => toggleDeparture(p.sofascore_id, depVal !== undefined ? undefined : 2)} style={{
                     fontFamily: 'var(--font-mono)', fontSize: '0.58rem', padding: '2px 7px',
                     borderRadius: '4px', cursor: 'pointer', flexShrink: 0,
-                    border: `1px solid ${depYear !== undefined ? '#ef444455' : 'rgba(255,255,255,0.1)'}`,
-                    background: depYear !== undefined ? 'rgba(239,68,68,0.1)' : 'transparent',
-                    color: depYear !== undefined ? '#ef4444' : 'rgba(255,255,255,0.35)',
+                    border: `1px solid ${depVal !== undefined ? '#ef444455' : 'rgba(255,255,255,0.1)'}`,
+                    background: depVal !== undefined ? 'rgba(239,68,68,0.1)' : 'transparent',
+                    color: depVal !== undefined ? '#ef4444' : 'rgba(255,255,255,0.35)',
                     transition: 'all 0.12s',
                   }}>
-                    {depYear !== undefined ? '✕' : '+ Abgang'}
+                    {depVal !== undefined ? '✕' : '+ Abgang'}
                   </button>
                 </div>
 
-                {depYear !== undefined && (
+                {depVal !== undefined && (
                   <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginTop: '6px', paddingLeft: '2px' }}>
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.58rem', color: 'rgba(255,255,255,0.25)', marginRight: '2px' }}>
-                      Abgang Jahr:
+                      weg ab:
                     </span>
-                    {[1, 2, 3, 4, 5].map(y => (
-                      <button key={y} onClick={() => toggleDeparture(p.sofascore_id, y)} style={{
-                        width: '22px', height: '22px', borderRadius: '3px', cursor: 'pointer',
-                        border: `1px solid ${depYear === y ? '#ef444470' : 'rgba(255,255,255,0.08)'}`,
-                        background: depYear === y ? 'rgba(239,68,68,0.15)' : 'transparent',
-                        color: depYear === y ? '#ef4444' : 'rgba(255,255,255,0.35)',
-                        fontFamily: 'var(--font-mono)', fontSize: '0.65rem',
-                      }}>{y}</button>
+                    {DEP_BUTTONS.map(btn => (
+                      <button key={btn.dep} onClick={() => toggleDeparture(p.sofascore_id, btn.dep)} style={{
+                        padding: '2px 6px', borderRadius: '3px', cursor: 'pointer',
+                        border: `1px solid ${depVal === btn.dep ? '#ef444470' : 'rgba(255,255,255,0.08)'}`,
+                        background: depVal === btn.dep ? 'rgba(239,68,68,0.15)' : 'transparent',
+                        color: depVal === btn.dep ? '#ef4444' : 'rgba(255,255,255,0.35)',
+                        fontFamily: 'var(--font-mono)', fontSize: '0.6rem',
+                        whiteSpace: 'nowrap',
+                      }}>{btn.label}</button>
                     ))}
                   </div>
                 )}
