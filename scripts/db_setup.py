@@ -115,6 +115,15 @@ CREATE TABLE IF NOT EXISTS player_stats (
 CREATE INDEX IF NOT EXISTS idx_players_league   ON players(league);
 CREATE INDEX IF NOT EXISTS idx_players_position ON players(position);
 CREATE INDEX IF NOT EXISTS idx_stats_season     ON player_stats(season);
+
+-- Cycle Radar: Bundesliga Kaderzyklen
+CREATE TABLE IF NOT EXISTS clubs (
+    tm_id           INTEGER PRIMARY KEY,
+    name            TEXT NOT NULL,
+    avg_age         NUMERIC,
+    top_players     JSONB,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 print("=" * 60)
